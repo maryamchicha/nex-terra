@@ -14,9 +14,7 @@
   --shadow: 0 1px 3px rgba(20,35,59,.08), 0 1px 2px rgba(20,35,59,.04);
   --shadow-lg: 0 8px 24px rgba(20,35,59,.12);
 }
-
 * { box-sizing: border-box; }
-
 body {
   margin: 0;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
@@ -24,16 +22,13 @@ body {
   color: var(--ink);
   line-height: 1.5;
 }
-
 a { color: var(--brand-dark); text-decoration: none; }
 a:hover { text-decoration: underline; }
-
 .app {
   max-width: 1200px;
   margin: 0 auto;
   padding: 0 20px 60px;
 }
-
 /* ---------- Header ---------- */
 .header {
   padding: 32px 0 20px;
@@ -59,7 +54,6 @@ a:hover { text-decoration: underline; }
   display: inline-block;
   margin-top: 10px;
 }
-
 /* ---------- Layout ---------- */
 .layout {
   display: grid;
@@ -69,7 +63,6 @@ a:hover { text-decoration: underline; }
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
 }
-
 /* ---------- Cards ---------- */
 .card {
   background: var(--surface);
@@ -87,19 +80,18 @@ a:hover { text-decoration: underline; }
   font-size: 14px;
   margin-bottom: 14px;
 }
-
 /* ---------- Map ---------- */
 .map-wrap {
-  height: 100%;
+  height: 400px;
   border-radius: var(--radius);
   overflow: hidden;
   box-shadow: var(--shadow-lg);
+  margin-bottom: 20px;
 }
 .map-wrap .leaflet-container {
   height: 100%;
   width: 100%;
 }
-
 /* ---------- Problem chips ---------- */
 .problems {
   display: flex;
@@ -115,7 +107,6 @@ a:hover { text-decoration: underline; }
   font-size: 13px;
   font-weight: 600;
 }
-
 /* ---------- Priority gauges ---------- */
 .priorities { display: flex; gap: 12px; flex-wrap: wrap; }
 .prio-btn {
@@ -136,7 +127,6 @@ a:hover { text-decoration: underline; }
   background: #eef8f2;
   box-shadow: 0 0 0 3px rgba(11,110,79,.15);
 }
-
 /* ---------- Metric grid ---------- */
 .metric-grid {
   display: grid;
@@ -153,7 +143,6 @@ a:hover { text-decoration: underline; }
 .metric .label { font-size: 12px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .04em; }
 .metric .value { font-size: 20px; font-weight: 700; }
 .metric .unit { font-size: 12px; color: var(--ink-soft); font-weight: 400; }
-
 /* ---------- Comparison table ---------- */
 .comp-table {
   width: 100%;
@@ -178,12 +167,10 @@ a:hover { text-decoration: underline; }
 .rank-1 { background: #d9f2e4; color: #0b6e4f; }
 .rank-2 { background: #fef3d6; color: #b7791f; }
 .rank-3 { background: #eef2f7; color: #4a5c74; }
-
 /* ---------- Scenario slider ---------- */
 .scenario-slider { margin: 10px 0; }
 .slider-label { font-weight: 600; margin-bottom: 6px; display: block; }
 input[type=range] { width: 100%; }
-
 /* ---------- Explanation ---------- */
 .explanations { display: grid; gap: 14px; margin-top: 16px; }
 .expl {
@@ -194,7 +181,6 @@ input[type=range] { width: 100%; }
 }
 .expl h3 { margin: 0 0 4px; font-size: 16px; }
 .expl p { margin: 4px 0; color: var(--ink-soft); font-size: 14px; }
-
 .choice {
   border: 2px solid var(--grid);
   border-radius: var(--radius);
@@ -206,7 +192,6 @@ input[type=range] { width: 100%; }
 .choice.selected { border-color: var(--brand); background: #eef8f2; }
 .choice .crop-name { font-weight: 600; }
 .choice .metrics { font-size: 13px; color: var(--ink-soft); }
-
 /* ---------- Simulated future banner ---------- */
 .future-banner {
   background: linear-gradient(135deg, #0b6e4f, #08553f);
@@ -221,9 +206,28 @@ input[type=range] { width: 100%; }
   background: rgba(255,255,255,.15);
   padding: 4px 10px; border-radius: 6px; font-size: 13px;
 }
-
 /* ---------- Responsive header ---------- */
 @media (max-width: 700px) {
   .header h1 { font-size: 22px; }
   .layout { grid-template-columns: 1fr; }
 }
+/* ---------- Added: synthetic-data badge, error box, scrollable table ---------- */
+.synthetic-badge {
+  background: #fef3d6;
+  color: #b7791f;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  margin-left: 8px;
+}
+.error-box {
+  background: #fdf3f2;
+  border: 1px solid #f3bfba;
+  color: #8a2f23;
+  padding: 12px 14px;
+  border-radius: 8px;
+  margin-bottom: 14px;
+  font-size: 14px;
+}
+.comp-wrap { overflow-x: auto; }
