@@ -1,6 +1,9 @@
 fastapi
 uvicorn[standard]
+pydantic
 scikit-learn
+scipy
 numpy
 pandas
+requests
 httpx
