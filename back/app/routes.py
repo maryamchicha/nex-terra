@@ -2,18 +2,17 @@
 
 import json
 import logging
-import os
+import time
 from pathlib import Path
+from statistics import mean
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request
 
 from . import config as _cfg, models
-from .models import (ComparisonItem, ErrorResponse, FieldResult, FieldUpdate,
-                     RotationRequest, RotationResult, ScenariosResult, OptimizationResult)
+from .models import (FieldResult, FieldUpdate, OptimizationResult,
+                     RotationRequest, RotationResult, ScenariosResult)
 from .simulator import simulator as sim
-from fastapi import Body
 
 router = APIRouter(tags=["nex-terra"])
 
@@ -21,24 +20,45 @@ log = logging.getLogger("nex-terra")
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FIELD_JSON = DATA_DIR / "field.json"
-CONFIG_JSON = DATA_DIR / "config.json"
 
-# In-memory "database" of the virtual field layers (SQLite mirrors this).
-_db = {"fields": {}, "rotations": []}
+# The three rotations compared by the engine. Crop names are the ones already
+# used in the history data, so the simulator knows them.
+ROTATIONS: Dict[str, Dict[str, Any]] = {
+    "A": {"label": "A. Continuous cereal",
+          "crops": ["winter_wheat", "winter_wheat", "winter_wheat"]},
+    "B": {"label": "B. Cereal–legume rotation",
+          "crops": ["winter_wheat", "faba_beans", "winter_wheat"]},
+    "C": {"label": "C. Diversified rotation",
+          "crops": ["winter_wheat", "faba_beans", "sunflower"]},
+}
+
+# Used only when live NASA data cannot be fetched. Always flagged synthetic.
+_NASA_FALLBACK: Dict[str, Any] = {
+    "temp_mean_c": 16.8,
+    "rainfall_mm_tot": 0.0,  # TODO: placeholder, check the unit the engine expects
+    "sun_hours": 5.0,
+    "humidity_pct": 45.0,
+    "evi": 0.42,
+    "sm": 0.30,
+    "cmip6": {"temp_mean_c": 18.6, "precipitation_mm": 0.0},
+    "_synthetic": True,
+    "source_note": "Synthetic fallback series: live NASA data unavailable.",
+}
+
+_NASA_TTL_REAL = 24 * 3600   # keep real data for 24 h
+_NASA_TTL_FALLBACK = 300     # retry real data after 5 min
+_nasa_cache: Dict[str, Any] = {"ts": 0.0, "ttl": 0.0, "data": None}
 
 
 # --------------------------------------------------------------------------- #
-#  Field + soil store
+#  Helpers
 # --------------------------------------------------------------------------- #
 def _load_field_json() -> Dict[str, Any]:
-    if FIELD_JSON.exists():
+    try:
         with open(FIELD_JSON, encoding="utf-8") as f:
             return json.load(f)
-    return {}
-
-
-def _ensure_db():
-    return _db
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
 def _soil_default() -> Dict[str, Any]:
@@ -59,32 +79,47 @@ def _build_soil_profile(soil: Optional[Dict[str, Any]]) -> sim.SoilProfile:
     return sim.build_soil_profile(p)
 
 
-def _nasa_payload() -> Dict[str, Any]:
-    """Pull real NASA observations for the demo field and return the payload
-    the engine's score_rotation() consumes."""
-    try:
-        # fetch real POWER/GPM/MODIS/SMAP observations for the Settat field
-        # (2019-2024) and embed them in the rotation score so the engine gets
-        # satellite-derived drought / vegetation / soil-moisture signals.
-        from app.nasa.client import (NasaClient, NasaConfig,
-                                     fetch_nasa_series)
-        nasa = fetch_nasa_series(32.75, -8.05, 2019, 2024)
-        return nasa
-    except Exception as exc:  # noqa: BLE001 - keep the demo online no matter what
-        log.warning("nasa payload unavailable: %s", exc)
-        return {
-            "temp_mean_c": 16.8,
-            "rainfall_mm_tot": 0.0,
-            "sun_hours": 5.0,
-            "humidity_pct": 45.0,
-            "evi": 0.42,
-            "sm": 0.30,
-            "cmip6": {"temp_mean_c": 18.6, "precipitation_mm": 0.0},
-        }
-
-
 def _default_climate() -> Dict[str, Any]:
     return {"temp_shift": 0.0, "precipitation": 1.0, "drought": 0.0}
+
+
+def _demo_field() -> Dict[str, Any]:
+    """Demo field for the frontend, built from data/field.json."""
+    raw = _load_field_json()
+    return {
+        "id": raw.get("field_code", "SET-001"),
+        "name": raw.get("name", "Settat demo field"),
+        "region": raw.get("region", "Settat region, Morocco"),
+        "lat": raw.get("lat", 32.75),
+        "lon": raw.get("lon", -8.05),
+        "area_ha": raw.get("area_ha", 10.0),
+        "terrain": raw.get("terrain", "flat"),
+        "irrigation": raw.get("irrigation", "rainfed"),
+        "soil": _soil_default(),
+    }
+
+
+def _nasa_payload() -> Dict[str, Any]:
+    """NASA observations for the demo field, cached in memory.
+
+    Real data is kept 24 h. If the live fetch fails (or the client itself
+    falls back to synthetic data), we retry after 5 minutes.
+    """
+    now = time.time()
+    if _nasa_cache["data"] is not None and now - _nasa_cache["ts"] < _nasa_cache["ttl"]:
+        return _nasa_cache["data"]
+
+    field = _demo_field()
+    try:
+        from .nasa.client import fetch_nasa_series
+        data = fetch_nasa_series(field["lat"], field["lon"], 2019, 2024)
+    except Exception as exc:  # noqa: BLE001 - keep the demo online no matter what
+        log.warning("nasa payload unavailable: %s", exc)
+        data = dict(_NASA_FALLBACK)
+
+    ttl = _NASA_TTL_FALLBACK if data.get("_synthetic") else _NASA_TTL_REAL
+    _nasa_cache.update(ts=now, ttl=ttl, data=data)
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -92,12 +127,10 @@ def _default_climate() -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 @router.get("/field", response_model=FieldResult)
 def get_field():
-    """Virtual field selection: returns the Settat demo field (the first/fixed
-    'farmer selects their field' step)."""
-    if not FIELD_JSON.exists():
+    """Virtual field selection: returns the Settat demo field."""
+    raw = _load_field_json()
+    if not raw:
         raise HTTPException(404, "No virtual field seed (data/field.json)")
-    with open(FIELD_JSON, encoding="utf-8") as f:
-        raw = json.load(f)
     return FieldResult(
         field_code=raw.get("field_code", "SET-001"),
         name=raw.get("name", "Demo field"),
@@ -113,25 +146,12 @@ def get_field():
 
 
 # --------------------------------------------------------------------------- #
-#  PUT /api/field
+#  PUT /api/field   (stateless: nothing is written to the server)
 # --------------------------------------------------------------------------- #
 @router.put("/field", response_model=FieldResult)
 def update_field(payload: FieldUpdate):
-    """Persist farmer field choices (location, previous crops, irrigation)."""
-    cfg = _load_field_json()
-    cfg.update({
-        "field_code": payload.field_code,
-        "lat": payload.lat,
-        "lon": payload.lon,
-        "region": payload.region,
-        "area_ha": payload.area_ha,
-        "terrain": payload.terrain,
-        "irrigation": payload.irrigation,
-        "previous_crops": list(payload.previous_crops),
-        "soil": {},
-    })
-    with open(FIELD_JSON, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    """Echo the farmer's field choices. Not persisted: the API is public and
+    the demo field is shared by all visitors."""
     return FieldResult(
         field_code=payload.field_code,
         name="Custom field",
@@ -151,7 +171,7 @@ def update_field(payload: FieldUpdate):
 # --------------------------------------------------------------------------- #
 @router.get("/soil", responses={200: {"model": Dict[str, Any]}})
 def get_soil():
-    """Remote fetch of SoilGrids soil properties for the selected field."""
+    """SoilGrids-like soil properties for the selected field."""
     return _soil_default()
 
 
@@ -160,8 +180,7 @@ def get_soil():
 # --------------------------------------------------------------------------- #
 @router.get("/history", response_model=List[Dict[str, Any]])
 def get_history():
-    """Past rotations for the field (pretend satellite/extension archive)."""
-    # Deterministic demo history: plausible past 3 rotations for Settat.
+    """Past rotations for the field (demo archive)."""
     return [
         {"year": 2021, "rotation": ["winter_wheat", "winter_wheat"],
          "water_mm": 781.2, "n_kg": -66.6, "score": 0.597},
@@ -180,17 +199,18 @@ def get_history():
 #  POST /api/simulate
 # --------------------------------------------------------------------------- #
 @router.post("/simulate", response_model=RotationResult)
-def simulate(payload: RotationRequest):
-    """Simulate one crop rotation (or the optimized one) under one climate state."""
-    rotator = app_state_roator()
+def simulate(payload: RotationRequest, request: Request):
+    """Simulate one crop rotation under one climate state."""
+    rotator = request.app.state.rotator
     soil = _build_soil_profile(payload.soil)
     climate = payload.climate or _default_climate()
-    nasa = _nasa_payload()  # real satellite/soil/climate-model observations
+    nasa = _nasa_payload()
+    crops = payload.crops or list(ROTATIONS["A"]["crops"])
 
-    # default demonstration rotation A / B / C
-    crops = payload.crops or ["winter_wheat", "winter_wheat", "winter_wheat"]
-
-    res = rotator.score_rotation(crops, soil, climate, nasa=nasa)
+    try:
+        res = rotator.score_rotation(crops, soil, climate, nasa=nasa)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rotation: {exc}") from exc
 
     return RotationResult(
         id=climate.get("id", "default"),
@@ -217,8 +237,7 @@ def simulate(payload: RotationRequest):
 # --------------------------------------------------------------------------- #
 @router.get("/scenarios", response_model=ScenariosResult)
 def list_scenarios():
-    """Return the future climate scenarios (NEX-GDDP-CMIP6 deltas) to stress-test
-    against."""
+    """Future climate scenarios (NEX-GDDP-CMIP6 deltas)."""
     return ScenariosResult(scenarios=_cfg.config.scenarios)
 
 
@@ -226,76 +245,98 @@ def list_scenarios():
 #  POST /api/compare
 # --------------------------------------------------------------------------- #
 @router.post("/compare", response_model=Dict[str, Any])
-def compare(payload: RotationRequest):
-    """Compare >=3 rotations (A / B / C) across all climate scenarios and rank
-    them.
+def compare(payload: RotationRequest, request: Request):
+    """Compare rotations A / B / C under every climate scenario.
 
     Returns:
-        - per-rotation metrics under each scenario
-        - ranked list (utility weighted by user priorities)
-        - the climate scenario that flips the ranking
+        - comparison: one row per (rotation, scenario)
+        - ranked: rotations ranked by mean score across scenarios
+        - climate_flip: scenarios where the winning rotation changes
     """
-    rotator = app_state_roator()
-    soap = _build_soil_profile(payload.soil)
-    soil = soap
+    rotator = request.app.state.rotator
+    soil = _build_soil_profile(payload.soil)
     nasa = _nasa_payload()
 
-    scenario_ids = [s.get("id", "default") for s in _cfg.config.scenarios]
-    demo_rotation = payload.crops or ["winter_wheat", "winter_wheat", "winter_wheat"]
+    scenarios = list(_cfg.config.scenarios)
+    if not scenarios:
+        raise HTTPException(500, "No climate scenarios configured")
 
-    comparisons = []
-    for sc in _cfg.config.scenarios:
-        sim_result = rotator.score_rotation(demo_rotation, soap, sc)
-        comparisons.append({
-            "scenario_id": sc.get("id", "default"),
-            "label": sc.get("label", "baseline"),
-            "temp_shift": sc.get("temp_shift", 0.0),
-            "precipitation": sc.get("precipitation", 1.0),
-            "drought": sc.get("drought", 0.0),
-            "rotation": list(sim_result["rotation"]),
-            "water_total_mm": sim_result["water_total_mm"],
-            "n_balance_kg": sim_result["n_balance_kg"],
-            "resilience_avg": sim_result["resilience_avg"],
-            "soil_protection_avg": sim_result["soil_protection_avg"],
-            "economic_potential_avg": sim_result["economic_potential_avg"],
-            "econ_per_water_mad_m3": sim_result["econ_per_water_mad_m3"],
-            "score": sim_result["score"],
-            "nasa": sim_result["nasa"],
+    rotations = {rid: dict(r) for rid, r in ROTATIONS.items()}
+    # A rotation sent by the client that is not A/B/C is added as "D"
+    custom = list(payload.crops) if payload.crops else None
+    if custom and custom not in [r["crops"] for r in rotations.values()]:
+        rotations["D"] = {"label": "D. Custom rotation", "crops": custom}
+
+    comparison: List[Dict[str, Any]] = []
+    try:
+        for rid, rot in rotations.items():
+            for sc in scenarios:
+                res = rotator.score_rotation(rot["crops"], soil, sc, nasa=nasa)
+                comparison.append({
+                    "rotation_id": rid,
+                    "rotation_label": rot["label"],
+                    "rotation": list(res["rotation"]),
+                    "scenario_id": sc.get("id", "default"),
+                    "label": sc.get("label", "baseline"),
+                    "temp_shift": sc.get("temp_shift", 0.0),
+                    "precipitation": sc.get("precipitation", 1.0),
+                    "drought": sc.get("drought", 0.0),
+                    "water_total_mm": res["water_total_mm"],
+                    "n_balance_kg": res["n_balance_kg"],
+                    "resilience_avg": res["resilience_avg"],
+                    "soil_protection_avg": res["soil_protection_avg"],
+                    "economic_potential_avg": res["economic_potential_avg"],
+                    "econ_per_water_mad_m3": res["econ_per_water_mad_m3"],
+                    "score": res["score"],
+                })
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rotation or scenario: {exc}") from exc
+
+    # ---- overall ranking: mean score across scenarios (stability) ----------
+    ranked: List[Dict[str, Any]] = []
+    for rid, rot in rotations.items():
+        rows = [c for c in comparison if c["rotation_id"] == rid]
+        scores = [float(r["score"]) for r in rows]
+        ranked.append({
+            "id": rid,
+            "label": rot["label"],
+            "rotation": rot["crops"],
+            "mean_score": round(mean(scores), 4),
+            "worst_score": round(min(scores), 4),
+            "water_mm": round(mean(float(r["water_total_mm"]) for r in rows), 1),
         })
+    ranked.sort(key=lambda r: r["mean_score"], reverse=True)
+    for i, r in enumerate(ranked, start=1):
+        r["rank"] = i
 
-    # rank all rotations under the selected / worst scenario
-    ranked = _rank(comparisons)
+    # ---- winner per scenario, and where the winner flips -------------------
+    winners: Dict[str, str] = {}
+    for sc in scenarios:
+        sid = sc.get("id", "default")
+        in_sc = [c for c in comparison if c["scenario_id"] == sid]
+        winners[sid] = max(in_sc, key=lambda c: c["score"])["rotation_id"]
 
-    # identify the scenario where the winner flips vs the baseline
-    base = _score_of(comparisons, "historical")
-    flip = None
-    for item in ranked:
-        for comp in comparisons:
-            if base and comp["score"] > base and item["score"] < comp["score"]:
-                pass
-    # simplest flip: the worst drought scenario
-    worst = max(comparisons, key=lambda c: c["temp_shift"])
-    if base:
-        worst_score = _score_of(comparisons, worst["scenario_id"])
-        flip = {"baseline_winner": base, "worst_winner": worst_score,
-                "worst_scenario": worst["scenario_id"]}
+    base_id = "historical" if "historical" in winners else next(iter(winners))
+    flipping = [sid for sid, w in winners.items() if w != winners[base_id]]
+    if flipping:
+        climate_flip = {
+            "baseline_scenario": base_id,
+            "baseline_winner": winners[base_id],
+            "flipping_scenarios": flipping,
+            "winners": winners,
+        }
+    else:
+        climate_flip = {"note": "No scenario changes the winning rotation.",
+                        "winners": winners}
 
     return {
-        "rotations": demo_rotation,
-        "rotation_names": {
-            "A_continuous_cereal": "A. Continuous cereal",
-            "B_cereal_legume": "B. Cereal-legume rotation",
-            "C_diversified": "C. Diversified (cover crop)",
-        },
-        "comparison": comparisons,
-        "ranked": [
-            {"rank": i + 1, "id": c["scenario_id"], "label": c["label"],
-             "score": c["score"], "water_mm": c["water_total_mm"]}
-            for i, c in enumerate(ranked)
-        ],
-        "climate_flip": flip or {"note": "No scenario flips the ranking."},
-        "scenario_ids": scenario_ids,
-        "scenarios": _cfg.config.scenarios,
+        "rotations": {rid: r["crops"] for rid, r in rotations.items()},
+        "rotation_names": {rid: r["label"] for rid, r in rotations.items()},
+        "comparison": comparison,
+        "ranked": ranked,
+        "climate_flip": climate_flip,
+        "scenario_ids": [s.get("id", "default") for s in scenarios],
+        "scenarios": scenarios,
         "nasa": nasa,
     }
 
@@ -304,112 +345,48 @@ def compare(payload: RotationRequest):
 #  POST /api/optimize
 # --------------------------------------------------------------------------- #
 @router.post("/optimize", response_model=OptimizationResult)
-def optimize(request: Optional[RotationRequest] = None):
-    """Search for the rotation that best satisfies the farmer's priorities
-    (water, nitrogen, resilience, soil, economy) under a future climate
-    scenario using SciPy differential evolution."""
+def optimize(request: Request, payload: Optional[RotationRequest] = None):
+    """Search for the rotation that best satisfies the priorities
+    (water, nitrogen, resilience, soil, economy) under a climate scenario."""
+    rotator = request.app.state.rotator
+    soil = _build_soil_profile(payload.soil if payload else None)
+    climate = (payload.climate if payload and payload.climate else None) or _default_climate()
 
-    rotator = app_state_roator()
-    soil = _build_soil_profile(request and request.soil)
-    climate = request and request.climate or _default_climate()
-
-    # default priorities: all equal
-    priorities = {
-        "water": 0.20,
-        "nitrogen": 0.15,
-        "resilience": 0.25,
-        "soil": 0.20,
-        "economy": 0.20,
-    }
-    # normalise
+    # TODO: priorities are fixed; accepting them from the client needs a model change
+    priorities = {"water": 0.20, "nitrogen": 0.15, "resilience": 0.25,
+                  "soil": 0.20, "economy": 0.20}
     s = sum(priorities.values()) or 1.0
     priorities = {k: v / s for k, v in priorities.items()}
 
-    res = rotator.optimize(soil, climate, priorities, max_seasons=3,
-                           water_cap_mm=None)
+    res = rotator.optimize(soil, climate, priorities, max_seasons=3, water_cap_mm=None)
     return OptimizationResult(**res)
 
 
 # --------------------------------------------------------------------------- #
-#  Ranking & explanation helpers (pure logic)
+#  GET /api/nasa
 # --------------------------------------------------------------------------- #
-def _rank(comparisons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Sort by utility = weighted score across scenarios and metrics."""
-    # primary sort: mean score across scenarios (stability)
-    comparisons = sorted(comparisons, key=lambda c: c["score"], reverse=True)
-    return comparisons
-
-
-def _score_of(comparisons: List[Dict[str, Any]], scenario_id: str) -> Optional[float]:
-    for c in comparisons:
-        if c["scenario_id"] == scenario_id:
-            return c["score"]
-    return None
-
-
-# --------------------------------------------------------------------------- #
-#  App state helpers
-# --------------------------------------------------------------------------- #
-def app_state_roator() -> sim.Rotator:
-    """Pull the app-wide rotator from the FastAPI app state (avoids circular
-    imports)."""
-    from .main import app  # local import to avoid module loop
-    return app.state.rotator
-
-
 @router.get("/nasa")
 def api_nasa():
-    """Return live satellite + climate-model observations for the demo field.
+    """Satellite + climate-model observations for the demo field.
 
-    Built from real NASA POWER / GPM / MODIS / SMAP / NEX-GDDP-CMIP6 sources;
-    falls back to deterministic synthetic values when a live retrieval is
-    unreachable. Designed so the frontend renders satellite data with zero
-    extra engineering.
-    """
-    from app.nasa.client import fetch_nasa_series
-    try:
-        return fetch_nasa_series(32.75, -8.05, 2019, 2024)
-    except Exception as exc:  # noqa: BLE001 - keep the demo online no matter what
-        log.warning("nasa payload unavailable: %s", exc)
-        return {
-            "temp_mean_c": 16.8,
-            "rainfall_mm_tot": 0.0,
-            "sun_hours": 5.0,
-            "humidity_pct": 45.0,
-            "evi": 0.42,
-            "sm": 0.30,
-            "cmip6": {"temp_mean_c": 18.6, "precipitation_mm": 0.0},
-            "source_note": "offline fallback — real NASA data unavailable",
-        }
+    Real NASA data when reachable; otherwise a series flagged
+    `_synthetic: true` with a `source_note`."""
+    return _nasa_payload()
 
 
 # --------------------------------------------------------------------------- #
-#  Frontend! (serve demo assets)
+#  GET /api/demo/seed.json
 # --------------------------------------------------------------------------- #
 @router.get("/demo/seed.json", response_model=Dict[str, Any])
 def demo_seed():
-    """Return deterministic synthetic data so the frontend can run without a
-    live database."""
+    """Seed data so the frontend can start without a database."""
     return {
-        "fields": [
-            {"id": "SET-001", "name": "Settat demo field",
-             "lat": 32.75, "lon": -8.05, "area_ha": 10.0,
-             "irrigation": "rainfed", "soil": _soil_default()},        ],  
-        "rotation_names": {  
-            "A_continuous_cereal": "A. Continuous cereal",  
-            "B_cereal_legume": "B. Cereal–legume rotation",  
-            "C_diversified": "C. Diversified rotation (cover crop)",  
-        },  
-        "scenarios": _cfg.config.scenarios,  
-        "priorities": {"water": 0.20, "nitrogen": 0.15, "resilience": 0.25,  
-                       "soil": 0.20, "economy": 0.20},  
-        "nasa": {  
-            "temp_mean_c": 16.8,  
-            "rainfall_mm_tot": 0.0,  
-            "sun_hours": 5.0,  
-            "humidity_pct": 45.0,  
-            "evi": 0.42,  
-            "sm": 0.30,  
-            "cmip6": {"temp_mean_c": 18.6, "precipitation_mm": 0.0},  
-        },  
+        "fields": [_demo_field()],
+        "rotation_names": {rid: r["label"] for rid, r in ROTATIONS.items()},
+        "scenarios": _cfg.config.scenarios,
+        "priorities": {"water": 0.20, "nitrogen": 0.15, "resilience": 0.25,
+                       "soil": 0.20, "economy": 0.20},
+        # Cached real data if already fetched, otherwise the flagged fallback.
+        # The frontend loads the live values from /api/nasa.
+        "nasa": _nasa_cache["data"] or dict(_NASA_FALLBACK),
     }
