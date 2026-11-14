@@ -1,89 +1,87 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import L from 'leaflet'
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
 import markerIcon from 'leaflet/dist/images/marker-icon.png'
 import markerShadow from 'leaflet/dist/images/marker-shadow.png'
 
+// Fix for the broken Leaflet marker icons with Vite
 delete L.Icon.Default.prototype._getIconUrl
-L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, shadowUrl: markerShadow })
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: markerIcon2x,
+  iconUrl: markerIcon,
+  shadowUrl: markerShadow,
+})
 
-const API = '/api'
+// Empty = same server (dev proxy). Set VITE_API_URL when the backend is deployed elsewhere.
+const API_URL = import.meta.env.VITE_API_URL || ''
 
 // ---- helpers ----
 async function api(path, opts) {
-  const res = await fetch(path, opts)
+  const res = await fetch(API_URL + path, opts)
   if (!res.ok) {
     let msg = `Request failed: ${res.status}`
-    try { msg = (await res.json()).detail || msg }
-    catch (_) {}
+    try { msg = (await res.json()).detail || msg } catch (_) {}
     throw new Error(msg)
   }
   return res.json()
 }
 
-function metricsHTML(r) {
-  const { water_total_mm, n_balance_kg, resilience_avg, soil_protection_avg, economic_potential_avg, score } = r
-  return `
-    <div class="metric-grid">
-      <div class="metric"><div class="label">Est. water (total)</div><div class="value">${Math.round(water_total_mm).toLocaleString()} <span class="unit">mm</span></div></div>
-      <div class="metric"><div class="label">N balance / season</div><div class="value" style="color:${n_balance_kg>=0?'#1e8449':'#c0392b'}">${n_balance_kg>=0?'+':''}${n_balance_kg.toFixed(1)} kg/ha</div></div>
-      <div class="metric"><div class="label">Climate resilience</div><div class="value">${(resilience_avg*100).toFixed(0)}%</div></div>
-      <div class="metric"><div class="label">Soil protection</div><div class="value">${(soil_protection_avg*100).toFixed(0)}%</div></div>
-      <div class="metric"><div class="label">Economic potential</div><div class="value">${Math.round(economic_potential_avg).toLocaleString()} MAD</div></div>
-    </div>`
-}
+const num = (v, d = 0) => (v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(d))
+const pct = v => (v == null || Number.isNaN(Number(v)) ? '—' : `${(Number(v) * 100).toFixed(0)}%`)
 
-// ---- small Sparkline-free rank label ----
+const DEFAULT_PRIORITIES = { water: 0.2, nitrogen: 0.15, resilience: 0.25, soil: 0.2, economy: 0.2 }
+
+// ---- Rank badge ----
 function RankBadge({ rank }) {
-  const cls = { 1: 'rank-1', 2: 'rank-2', 3: 'rank-3' } [String(rank)] || ''
+  const cls = { 1: 'rank-1', 2: 'rank-2', 3: 'rank-3' }[rank] || ''
   return <span className={`rank-badge ${cls}`}>{rank}</span>
 }
 
 // ---- Map component ----
-function FieldMap({ field, onFieldClick }) {
-  const [map, setMap] = useState(null)
+function FieldMap({ field }) {
+  const ref = useRef(null)
 
   useEffect(() => {
-    if (!onFieldClick) return
-    const L = require('leaflet')
-    const container = document.getElementById('field-map')
-    const m = L.map(container).setView([field.lat, field.lon], 12)
-    L.tileLayer('/tiles/0/{z}/{x}/{y}.png', {
-      attribution: 'tiles: local placeholder (no external CDN)',
+    if (!ref.current || !field) return
+    const m = L.map(ref.current).setView([field.lat, field.lon], 12)
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '© OpenStreetMap contributors',
     }).addTo(m)
-    L.rectangle([
-      [field.lat + 0.15, field.lon - 0.20],
-      [field.lat - 0.15, field.lon + 0.20],
-    ], {
-      color: '#0b6e4f',
-      fillColor: '#0b6e4f',
-      fillOpacity: 0.10,
-      weight: 2,
-      dashArray: '4 4',
-    }).addTo(m)
-    const circle = L.circle([field.lat, field.lon], {
+
+    // Circle with the real area of the field (area = π r²)
+    L.circle([field.lat, field.lon], {
       color: '#0b6e4f',
       fillColor: '#0b6e4f',
       fillOpacity: 0.25,
-      radius: field.area_ha * 100,
-      weight: 3
+      weight: 3,
+      radius: Math.sqrt((field.area_ha * 10000) / Math.PI),
     }).addTo(m)
-    const label = L.marker([field.lat, field.lon]).addTo(m)
-    label.bindPopup(`<b>${field.name}</b><br>${field.region}<br>${field.area_ha} ha · ${field.irrigation} · ${field.terrain}`)
-    setMap(m)
-  }, [field, onFieldClick])
 
-  return <div id="field-map" className="map-wrap"></div>
+    L.marker([field.lat, field.lon])
+      .addTo(m)
+      .bindPopup(
+        `<b>${field.name}</b><br>${field.region ?? ''}<br>${field.area_ha} ha · ${field.irrigation ?? ''} · ${field.terrain ?? ''}`
+      )
+
+    return () => m.remove() // clean up, so the map is not created twice
+  }, [field])
+
+  return <div ref={ref} className="map-wrap" />
 }
 
-// ---- Reusable fetch to seed the demo state ----
+// ---- Seed data (with a minimal offline fallback) ----
 async function demoSeed() {
   try {
-    return await api('/demo/seed.json')
+    return await api('/api/demo/seed.json')
   } catch (_) {
-    // return a minimal fallback so the UI still renders
     return {
-      fields: [{ id: 'SET-001', name: 'Settat demo field', lat: 32.75, lon: -8.05, area_ha: 10.0, irrigation: 'rainfed', soil: { ph: 8.1, organic_c_pct: 0.9, nacl_ppth: 6.0 } }],
+      fields: [{
+        id: 'SET-001', name: 'Settat demo field', region: 'Settat region, Morocco',
+        lat: 32.75, lon: -8.05, area_ha: 10.0, irrigation: 'rainfed', terrain: 'flat',
+        soil: { ph: 8.1, organic_c_pct: 0.9, nacl_ppth: 6.0 },
+      }],
       rotation_names: { A: 'A. Continuous cereal', B: 'B. Cereal–legume', C: 'C. Diversified' },
       scenarios: [
         { id: 'historical', label: 'Historical baseline', temp_shift: 0.0, precipitation: 1.0, drought: 0.0 },
@@ -91,7 +89,7 @@ async function demoSeed() {
         { id: 'severe_drying', label: 'Severe drying', temp_shift: 1.8, precipitation: 0.78, drought: 0.35 },
         { id: 'hot_wet', label: 'Hot + wet', temp_shift: 2.2, precipitation: 1.12, drought: 0.10 },
       ],
-      priorities: { water: 0.2, nitrogen: 0.15, resilience: 0.25, soil: 0.2, economy: 0.2 },
+      priorities: DEFAULT_PRIORITIES,
     }
   }
 }
@@ -100,21 +98,21 @@ async function demoSeed() {
 export default function App() {
   const [field, setField] = useState(null)
   const [scenarios, setScenarios] = useState([])
-  const [priorities, setPriorities] = useState({ water: 0.2, nitrogen: 0.15, resilience: 0.25, soil: 0.2, economy: 0.2 })
+  const [priorities, setPriorities] = useState(DEFAULT_PRIORITIES)
+  const [focus, setFocus] = useState('resilience')
   const [activeScenario, setActiveScenario] = useState('historical')
   const [comparison, setComparison] = useState(null)
   const [nasaData, setNasaData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
 
   const loadDemo = useCallback(async () => {
     const seed = await demoSeed()
-    setField(seed.fields[0])
-    setScenarios(seed.scenarios)
-    setPriorities(seed.priorities)
-    // fetch live NASA observations
+    setField(seed.fields?.[0] ?? null)
+    setScenarios(seed.scenarios ?? [])
+    setPriorities(seed.priorities ?? DEFAULT_PRIORITIES)
     try {
-      const n = await api('/api/nasa')
-      setNasaData(n)
+      setNasaData(seed.nasa ?? (await api('/api/nasa')))
     } catch (_) {
       setNasaData(null)
     }
@@ -124,33 +122,40 @@ export default function App() {
     loadDemo().finally(() => setLoading(false))
   }, [loadDemo])
 
-  // run comparison on every change
+  // Run the comparison once the field is known
   useEffect(() => {
-    if (!field || scenarios.length === 0) return
-    async function run() {
-      const payload = { crops: ['winter_wheat', 'winter_wheat', 'winter_wheat'], climate: { temp_shift: 0, precipitation: 1, drought: 0 } }
-      const comp = await api('/api/compare', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-      setComparison(comp)
-    }
-    run()
-  }, [field, scenarios, priorities, activeScenario])
+    if (!field) return
+    const ctrl = new AbortController()
+    setError(null)
+    api('/api/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        crops: ['winter_wheat', 'winter_wheat', 'winter_wheat'],
+        climate: { temp_shift: 0, precipitation: 1, drought: 0 },
+      }),
+      signal: ctrl.signal,
+    })
+      .then(setComparison)
+      .catch(e => { if (e.name !== 'AbortError') setError(e.message) })
+    return () => ctrl.abort()
+  }, [field])
 
-  if (loading) {
+  if (loading || !field) {
     return (
       <div className="app">
-        <div className="card" style={{ textAlign: 'center', padding: '40px' }}>Loading field &amp; engine…</div>
+        <div className="card" style={{ textAlign: 'center', padding: '40px' }}>
+          Loading field &amp; engine…
+        </div>
       </div>
     )
-  }   const sc = scenarios.find(s => s.id === activeScenario) || scenarios[0]
-    const comparisonA = comparison
-    const activeComp = comparisonA ? comparisonA.comparison.find(c => c.scenario_id === activeScenario) : null
-    const waterText = activeComp ? activeComp.water_total_mm.toFixed(0) : '—'
-    const resilienceText = activeComp ? ((activeComp.resilience_avg || 0) * 100).toFixed(0) : '—'
-    const topRotation = comparisonA?.ranked?.[0]?.id
+  }
+
+  const sc = scenarios.find(s => s.id === activeScenario) || scenarios[0]
+  const rows = comparison?.comparison ?? []
+  const activeComp = rows.find(c => c.scenario_id === activeScenario)
+  const ranked = comparison?.ranked ?? []
+  const sliderIndex = Math.max(0, scenarios.findIndex(s => s.id === activeScenario))
 
   return (
     <div className="app">
@@ -163,10 +168,10 @@ export default function App() {
       <div className="layout">
         {/* left: map + problems */}
         <div>
-          <FieldMap field={field} onFieldClick={() => {}} />
+          <FieldMap field={field} />
           <div className="card">
             <h2>Selected field</h2>
-            <p className="sub">{field.name} · {field.region}</p>
+            <p className="sub">{field.name}{field.region ? ` · ${field.region}` : ''}</p>
             <p className="sub">{field.area_ha} ha · irrigation: <strong>{field.irrigation}</strong></p>
             <div className="problems">
               <span className="problem-chip">Drought &amp; water scarcity</span>
@@ -181,76 +186,121 @@ export default function App() {
         <div>
           <div className="card">
             <h2>Which rotation survives the next five years?</h2>
-            <p className="sub">Compare {comparisonA?.rotation_names?.A}{' '}
-              <strong>A. Continuous cereal · B. Cereal–legume · C. Diversified (cover crop)</strong> across future climate scenarios.</p>
+            <p className="sub">
+              <strong>A. Continuous cereal · B. Cereal–legume · C. Diversified (cover crop)</strong>{' '}
+              across future climate scenarios.
+            </p>
 
-            <div className="card" style={{ padding: '0 0 14px 0' }}>
-              <label className="slider-label">Future climate scenario (NEX-GDDP-CMIP6 deltas)</label>
-              <input
-                type="range"
-                min={0}
-                max={scenarios.length - 1}
-                value={scenarios.findIndex(s => s.id === activeScenario)}
-                onChange={e => setActiveScenario(scenarios[e.target.value].id)}
-                className="scenario-slider"
-              />
-              <div className="priorities">
-                {(Object.keys(priorities)).map(k => (
-                  <button
-                    key={k}
-                    className={`prio-btn ${k === activeScenario && false}`}
-                    onClick={() => {}}
-                    title={`Prioritize ${k}`}
-                  >
-                    {k}
-                  </button>
-                ))}
-              </div>
-              <div className="future-banner">
-                <p><strong>{activeScenario.replace(/_/g, ' ')}</strong></p>
-                <p>+{sc.temp_shift.toFixed(1)}°C warming · precipitation {sc.precipitation >= 1 ? '+' : ''}{Math.round((sc.precipitation - 1) * 100)}% · drought index {sc.drought.toFixed(2)}</p>
-                <div className="impacts">
-                  <span className="impact">water {waterText} mm</span>
-                  <span className="impact">resilience {comparisonA ? (comparisonA.comparison.find(c => c.scenario_id === activeScenario)?.resilience_avg || 0) : 0}</span>
-                </div>
-              </div>
-              {nasaData && (
-                <div className="card" style={{ padding: '12px 14px', background: '#f4faf6' }}>
-                  <div className="sub" style={{ fontWeight: 700, marginBottom: 6 }}>Satellite observations (NEX TERRA)</div>
-                  <div className="sub"><b>Surface temp:</b> {nasaData.temp_mean_c.toFixed(2)} °C · <b>Rainfall:</b> {nasaData.rainfall_mm_tot.toFixed(1)} mm · <b>Sun hours:</b> {nasaData.sun_hours.toFixed(1)} · <b>Humidity:</b> {nasaData.humidity_pct.toFixed(0)}%</div>
-                  <div className="sub"><b>Vegetation (EVI):</b> {nasaData.evi.toFixed(3)} · <b>Soil moisture (SMAP):</b> {nasaData.sm.toFixed(3)} · <b>Future warming (CMIP6):</b> +{nasaData.cmip6?.temp_mean_c?.toFixed(1) || '—'}°C</div>
-                  <div className="sub" style={{ fontSize: 12, color: '#4a5c74' }}>{nasaData.source_note || 'Observed window: 2019–2024.'}</div>
-                </div>
-              )}
+            {error && <div className="error-box">⚠ Could not load the comparison: {error}</div>}
+
+            <label className="slider-label">Future climate scenario (NEX-GDDP-CMIP6 deltas)</label>
+            <input
+              type="range"
+              min={0}
+              max={Math.max(0, scenarios.length - 1)}
+              value={sliderIndex}
+              onChange={e => setActiveScenario(scenarios[Number(e.target.value)].id)}
+              className="scenario-slider"
+            />
+
+            <div className="sub" style={{ marginTop: 10 }}>Priority focus (display only for now)</div>
+            <div className="priorities">
+              {Object.keys(priorities).map(k => (
+                <button
+                  key={k}
+                  className={`prio-btn ${k === focus ? 'active' : ''}`}
+                  onClick={() => setFocus(k)}
+                  title={`Focus on ${k}`}
+                >
+                  {k}
+                </button>
+              ))}
             </div>
 
-            {comparisonA && (
+            {sc && (
+              <div className="future-banner">
+                <p><strong>{sc.label ?? sc.id.replace(/_/g, ' ')}</strong></p>
+                <p>
+                  +{num(sc.temp_shift, 1)}°C warming · precipitation{' '}
+                  {sc.precipitation >= 1 ? '+' : ''}{Math.round((sc.precipitation - 1) * 100)}% ·
+                  drought index {num(sc.drought, 2)}
+                </p>
+                <div className="impacts">
+                  <span className="impact">water {num(activeComp?.water_total_mm)} mm</span>
+                  <span className="impact">resilience {pct(activeComp?.resilience_avg)}</span>
+                </div>
+              </div>
+            )}
+
+            {nasaData && (
+              <div className="card" style={{ padding: '12px 14px', background: '#f4faf6' }}>
+                <div className="sub" style={{ fontWeight: 700, marginBottom: 6 }}>
+                  Satellite observations (NEX TERRA)
+                  {nasaData._synthetic && <span className="synthetic-badge">synthetic data</span>}
+                </div>
+                <div className="sub">
+                  <b>Surface temp:</b> {num(nasaData.temp_mean_c, 2)} °C ·{' '}
+                  <b>Rainfall:</b> {num(nasaData.rainfall_mm_tot, 1)} mm ·{' '}
+                  <b>Sun hours:</b> {num(nasaData.sun_hours, 1)} ·{' '}
+                  <b>Humidity:</b> {num(nasaData.humidity_pct)}%
+                </div>
+                <div className="sub">
+                  <b>Vegetation (EVI):</b> {num(nasaData.evi, 3)} ·{' '}
+                  <b>Soil moisture (SMAP):</b> {num(nasaData.sm, 3)} ·{' '}
+                  <b>Future warming (CMIP6):</b> +{num(nasaData.cmip6?.temp_mean_c, 1)}°C
+                </div>
+                <div className="sub" style={{ fontSize: 12, color: '#4a5c74' }}>
+                  {nasaData._synthetic
+                    ? (nasaData.source_note || 'Synthetic fallback series (NASA servers not reachable).')
+                    : (nasaData.source_note || 'Observed window: 2019–2024.')}
+                </div>
+              </div>
+            )}
+
+            {comparison && (
               <>
-                <div className="sub" style={{ marginBottom: 8 }}>Ranked by stability across climate futures (utility weighted by your priorities).</div>
-                <table className="comp-table">
-                  <thead><tr>
-                    <th>Rank</th><th>Scenario</th><th>Crops</th><th>Water (mm)</th><th>N (kg/ha)</th><th>Resilience</th><th>Soil</th><th>Economy (MAD)</th><th>Score</th>
-                  </tr></thead>
-                  <tbody>
-                    {comparisonA.comparison.map((c, i) => (
-                      <tr key={c.scenario_id}>
-                        <td><RankBadge rank={i + 1} /></td>
-                        <td><strong>{c.label}</strong></td>
-                        <td>{c.rotation.join(' · ')}</td>
-                        <td>{c.water_total_mm.toFixed(0)}</td>
-                        <td>{c.n_balance_kg.toFixed(1)}</td>
-                        <td>{(c.resilience_avg * 100).toFixed(0)}%</td>
-                        <td>{(c.soil_protection_avg * 100).toFixed(0)}%</td>
-                        <td>{c.economic_potential_avg.toFixed(0)}</td>
-                        <td>{c.score.toFixed(3)}</td>
+                <div className="sub" style={{ margin: '14px 0 8px' }}>
+                  Results per climate scenario.
+                </div>
+                <div className="comp-wrap">
+                  <table className="comp-table">
+                    <thead>
+                      <tr>
+                        <th>Scenario</th><th>Crops</th><th>Water (mm)</th><th>N (kg/ha)</th>
+                        <th>Resilience</th><th>Soil</th><th>Economy (MAD)</th><th>Score</th>
                       </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map(c => (
+                        <tr key={c.scenario_id}>
+                          <td><strong>{c.label}</strong></td>
+                          <td>{(c.rotation ?? []).join(' · ')}</td>
+                          <td>{num(c.water_total_mm)}</td>
+                          <td>{num(c.n_balance_kg, 1)}</td>
+                          <td>{pct(c.resilience_avg)}</td>
+                          <td>{pct(c.soil_protection_avg)}</td>
+                          <td>{num(c.economic_potential_avg)}</td>
+                          <td>{num(c.score, 3)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {ranked.length > 0 && (
+                  <>
+                    <div className="sub" style={{ marginTop: 14, marginBottom: 6 }}>
+                      Rotation ranking (stability across climate futures):
+                    </div>
+                    {ranked.map((r, i) => (
+                      <div key={r.id ?? i} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+                        <RankBadge rank={i + 1} />
+                        <strong>{r.label ?? r.id}</strong>
+                      </div>
                     ))}
-                  </tbody>
-                </table>
+                  </>
+                )}
 
-                <div className="sub" style={{ marginTop: 14, marginBottom: 6 }}>Top rotation under baseline: <strong>{comparisonA?.ranked?.[0]?.label}</strong></div>
-
-                {/* Explanation cards A / B / C */}
                 <div className="explanations">
                   <div className="expl">
                     <h3>A · Continuous cereal</h3>
@@ -265,8 +315,6 @@ export default function App() {
                     <p>Best soil protection and climate resilience, but highest water and capital demand — fragile in extreme drought.</p>
                   </div>
                 </div>
-
-                <div className="sub" style={{ marginTop: 14 }}>Water cap (mm) used by the optimizer: approx {Math.round((comparisonA.comparison.find(c => c.scenario_id === 'historical')?.water_total_mm || 0) * 0.9)} mm (90% of baseline).</div>
               </>
             )}
           </div>
