@@ -29,7 +29,21 @@ async function api(path, opts) {
 const num = (v, d = 0) => (v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(d))
 const pct = v => (v == null || Number.isNaN(Number(v)) ? '—' : `${(Number(v) * 100).toFixed(0)}%`)
 
-const DEFAULT_PRIORITIES = { water: 0.2, nitrogen: 0.15, resilience: 0.25, soil: 0.2, economy: 0.2 }
+// Criteria used to rank the rotations (higher value = better rank)
+const FOCUS = [
+  { key: 'overall', label: 'overall score', value: c => c.score },
+  { key: 'water', label: 'water', value: c => -c.water_total_mm },
+  { key: 'nitrogen', label: 'nitrogen', value: c => c.n_balance_kg },
+  { key: 'resilience', label: 'resilience', value: c => c.resilience_avg },
+  { key: 'soil', label: 'soil', value: c => c.soil_protection_avg },
+  { key: 'economy', label: 'economy', value: c => c.economic_potential_avg },
+]
+
+// Same crops as rotation A: the backend always compares A, B and C
+const COMPARE_BODY = {
+  crops: ['winter_wheat', 'winter_wheat', 'winter_wheat'],
+  climate: { temp_shift: 0, precipitation: 1, drought: 0 },
+}
 
 // ---- Rank badge ----
 function RankBadge({ rank }) {
@@ -80,16 +94,13 @@ async function demoSeed() {
       fields: [{
         id: 'SET-001', name: 'Settat demo field', region: 'Settat region, Morocco',
         lat: 32.75, lon: -8.05, area_ha: 10.0, irrigation: 'rainfed', terrain: 'flat',
-        soil: { ph: 8.1, organic_c_pct: 0.9, nacl_ppth: 6.0 },
       }],
-      rotation_names: { A: 'A. Continuous cereal', B: 'B. Cereal–legume', C: 'C. Diversified' },
       scenarios: [
         { id: 'historical', label: 'Historical baseline', temp_shift: 0.0, precipitation: 1.0, drought: 0.0 },
         { id: 'mild_warming_wet', label: 'Mild warming + wetter', temp_shift: 1.0, precipitation: 1.05, drought: 0.0 },
         { id: 'severe_drying', label: 'Severe drying', temp_shift: 1.8, precipitation: 0.78, drought: 0.35 },
         { id: 'hot_wet', label: 'Hot + wet', temp_shift: 2.2, precipitation: 1.12, drought: 0.10 },
       ],
-      priorities: DEFAULT_PRIORITIES,
     }
   }
 }
@@ -98,8 +109,7 @@ async function demoSeed() {
 export default function App() {
   const [field, setField] = useState(null)
   const [scenarios, setScenarios] = useState([])
-  const [priorities, setPriorities] = useState(DEFAULT_PRIORITIES)
-  const [focus, setFocus] = useState('resilience')
+  const [focus, setFocus] = useState('overall')
   const [activeScenario, setActiveScenario] = useState('historical')
   const [comparison, setComparison] = useState(null)
   const [nasaData, setNasaData] = useState(null)
@@ -110,16 +120,12 @@ export default function App() {
     const seed = await demoSeed()
     setField(seed.fields?.[0] ?? null)
     setScenarios(seed.scenarios ?? [])
-    setPriorities(seed.priorities ?? DEFAULT_PRIORITIES)
-    try {
-      setNasaData(seed.nasa ?? (await api('/api/nasa')))
-    } catch (_) {
-      setNasaData(null)
-    }
   }, [])
 
   useEffect(() => {
     loadDemo().finally(() => setLoading(false))
+    // NASA data loads in the background (it can be slow on the first call)
+    api('/api/nasa').then(setNasaData).catch(() => setNasaData(null))
   }, [loadDemo])
 
   // Run the comparison once the field is known
@@ -130,10 +136,7 @@ export default function App() {
     api('/api/compare', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        crops: ['winter_wheat', 'winter_wheat', 'winter_wheat'],
-        climate: { temp_shift: 0, precipitation: 1, drought: 0 },
-      }),
+      body: JSON.stringify(COMPARE_BODY),
       signal: ctrl.signal,
     })
       .then(setComparison)
@@ -152,10 +155,19 @@ export default function App() {
   }
 
   const sc = scenarios.find(s => s.id === activeScenario) || scenarios[0]
-  const rows = comparison?.comparison ?? []
-  const activeComp = rows.find(c => c.scenario_id === activeScenario)
+  const scId = sc?.id
+  const sliderIndex = Math.max(0, scenarios.findIndex(s => s.id === scId))
+  const focusValue = (FOCUS.find(f => f.key === focus) || FOCUS[0]).value
+
+  // Rotations for the selected scenario, sorted by the chosen criterion
+  const scenarioRows = (comparison?.comparison ?? [])
+    .filter(c => c.scenario_id === scId)
+    .sort((a, b) => focusValue(b) - focusValue(a))
+  const best = scenarioRows[0]
+
   const ranked = comparison?.ranked ?? []
-  const sliderIndex = Math.max(0, scenarios.findIndex(s => s.id === activeScenario))
+  const flipIds = comparison?.climate_flip?.flipping_scenarios ?? []
+  const flipLabels = flipIds.map(id => scenarios.find(s => s.id === id)?.label ?? id)
 
   return (
     <div className="app">
@@ -187,11 +199,12 @@ export default function App() {
           <div className="card">
             <h2>Which rotation survives the next five years?</h2>
             <p className="sub">
-              <strong>A. Continuous cereal · B. Cereal–legume · C. Diversified (cover crop)</strong>{' '}
+              <strong>A. Continuous cereal · B. Cereal–legume · C. Diversified</strong>{' '}
               across future climate scenarios.
             </p>
 
             {error && <div className="error-box">⚠ Could not load the comparison: {error}</div>}
+            {!comparison && !error && <div className="sub">Computing the comparison…</div>}
 
             <label className="slider-label">Future climate scenario (NEX-GDDP-CMIP6 deltas)</label>
             <input
@@ -203,32 +216,34 @@ export default function App() {
               className="scenario-slider"
             />
 
-            <div className="sub" style={{ marginTop: 10 }}>Priority focus (display only for now)</div>
+            <div className="sub" style={{ marginTop: 10 }}>Rank the rotations by:</div>
             <div className="priorities">
-              {Object.keys(priorities).map(k => (
+              {FOCUS.map(f => (
                 <button
-                  key={k}
-                  className={`prio-btn ${k === focus ? 'active' : ''}`}
-                  onClick={() => setFocus(k)}
-                  title={`Focus on ${k}`}
+                  key={f.key}
+                  className={`prio-btn ${f.key === focus ? 'active' : ''}`}
+                  onClick={() => setFocus(f.key)}
                 >
-                  {k}
+                  {f.label}
                 </button>
               ))}
             </div>
 
             {sc && (
               <div className="future-banner">
-                <p><strong>{sc.label ?? sc.id.replace(/_/g, ' ')}</strong></p>
+                <p><strong>{sc.label ?? String(sc.id).replace(/_/g, ' ')}</strong></p>
                 <p>
                   +{num(sc.temp_shift, 1)}°C warming · precipitation{' '}
                   {sc.precipitation >= 1 ? '+' : ''}{Math.round((sc.precipitation - 1) * 100)}% ·
                   drought index {num(sc.drought, 2)}
                 </p>
-                <div className="impacts">
-                  <span className="impact">water {num(activeComp?.water_total_mm)} mm</span>
-                  <span className="impact">resilience {pct(activeComp?.resilience_avg)}</span>
-                </div>
+                {best && (
+                  <div className="impacts">
+                    <span className="impact">best here: {best.rotation_label}</span>
+                    <span className="impact">water {num(best.water_total_mm)} mm</span>
+                    <span className="impact">resilience {pct(best.resilience_avg)}</span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -260,20 +275,23 @@ export default function App() {
             {comparison && (
               <>
                 <div className="sub" style={{ margin: '14px 0 8px' }}>
-                  Results per climate scenario.
+                  Rotations under <strong>{sc?.label}</strong>, ranked by{' '}
+                  <strong>{FOCUS.find(f => f.key === focus)?.label}</strong>.
                 </div>
                 <div className="comp-wrap">
                   <table className="comp-table">
                     <thead>
                       <tr>
-                        <th>Scenario</th><th>Crops</th><th>Water (mm)</th><th>N (kg/ha)</th>
-                        <th>Resilience</th><th>Soil</th><th>Economy (MAD)</th><th>Score</th>
+                        <th>Rank</th><th>Rotation</th><th>Crops</th><th>Water (mm)</th>
+                        <th>N (kg/ha)</th><th>Resilience</th><th>Soil</th>
+                        <th>Economy (MAD)</th><th>Score</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {rows.map(c => (
-                        <tr key={c.scenario_id}>
-                          <td><strong>{c.label}</strong></td>
+                      {scenarioRows.map((c, i) => (
+                        <tr key={`${c.rotation_id}-${c.scenario_id}`}>
+                          <td><RankBadge rank={i + 1} /></td>
+                          <td><strong>{c.rotation_label}</strong></td>
                           <td>{(c.rotation ?? []).join(' · ')}</td>
                           <td>{num(c.water_total_mm)}</td>
                           <td>{num(c.n_balance_kg, 1)}</td>
@@ -289,30 +307,42 @@ export default function App() {
 
                 {ranked.length > 0 && (
                   <>
-                    <div className="sub" style={{ marginTop: 14, marginBottom: 6 }}>
-                      Rotation ranking (stability across climate futures):
+                    <div className="sub" style={{ marginTop: 16, marginBottom: 6 }}>
+                      Overall ranking across all climate scenarios (mean score):
                     </div>
-                    {ranked.map((r, i) => (
-                      <div key={r.id ?? i} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-                        <RankBadge rank={i + 1} />
-                        <strong>{r.label ?? r.id}</strong>
+                    {ranked.map(r => (
+                      <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
+                        <RankBadge rank={r.rank} />
+                        <strong>{r.label}</strong>
+                        <span className="sub" style={{ margin: 0 }}>
+                          mean {num(r.mean_score, 3)} · worst case {num(r.worst_score, 3)}
+                        </span>
                       </div>
                     ))}
                   </>
                 )}
 
+                {flipLabels.length > 0 && (
+                  <div className="sub" style={{ marginTop: 10 }}>
+                    ⚠ The best rotation changes under: <strong>{flipLabels.join(', ')}</strong>.
+                  </div>
+                )}
+
+                <div className="sub" style={{ marginTop: 16, marginBottom: 6 }}>
+                  General agronomic expectations (not computed by the engine, compare with the results above):
+                </div>
                 <div className="explanations">
                   <div className="expl">
                     <h3>A · Continuous cereal</h3>
-                    <p>Risk of pest/disease build-up and soil nutrient mining. Highest water use. Scores lowest under drying.</p>
+                    <p>Risk of pest/disease build-up and soil nutrient mining. Highest water use.</p>
                   </div>
                   <div className="expl">
                     <h3>B · Cereal–legume rotation</h3>
-                    <p>Legume fixes nitrogen, breaks pest cycles, cuts fertiliser need. Most balanced across all climates.</p>
+                    <p>Legume fixes nitrogen, breaks pest cycles, cuts fertiliser need.</p>
                   </div>
                   <div className="expl">
-                    <h3>C · Diversified with cover crop</h3>
-                    <p>Best soil protection and climate resilience, but highest water and capital demand — fragile in extreme drought.</p>
+                    <h3>C · Diversified rotation</h3>
+                    <p>Better soil protection and diversity, but higher capital and water demand.</p>
                   </div>
                 </div>
               </>
